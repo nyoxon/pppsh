@@ -1,0 +1,1009 @@
+#!/bin/sh
+set -eu
+set -f
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  pppsh profile list|show NAME|validate NAME|remove NAME [--local-only]
+  pppsh profile create NAME [--host HOST] [--admin-user USER] [--local-ip IP] [--peer-ip IP] [--mtu N] [--source-ip IP] [--privilege sudo|su]
+  pppsh connect PROFILE
+  pppsh start|stop|status PROFILE
+  pppsh logs PROFILE [--follow]
+
+connect runs in the foreground; stop it with Ctrl-C.
+EOF
+    exit 2
+}
+
+fail() {
+    printf 'pppsh: %s\n' "$*" >&2
+    exit 1
+}
+
+is_ipv4() {
+    address=$1
+    case "$address" in
+        ''|.*|*.|*..*|*[!0-9.]*) return 1 ;;
+    esac
+
+    old_ifs=$IFS
+    IFS=.
+    set -- $address
+    IFS=$old_ifs
+
+    [ "$#" -eq 4 ] || return 1
+
+    for octet do
+        case "$octet" in
+            0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+            *) return 1 ;;
+        esac
+
+        [ "$octet" -le 255 ] || return 1
+    done
+}
+
+is_safe_path() {
+    case "$1" in
+        /*) case "$1" in *[!A-Za-z0-9_./-]*) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+
+is_root_owned() {
+    [ "$(stat -c %u "$1")" = 0 ]
+}
+
+is_private_file() {
+    mode=$(stat -c %a "$1") || return 1
+
+    case "$mode" in
+        ''|*[!0-7]*) return 1 ;;
+    esac
+
+    [ $((0$mode % 64)) -eq 0 ]
+}
+
+valid_name() {
+    case "$1" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+}
+
+profile_path() {
+    profile_dir="/etc/pppsh/profiles/$1"
+    legacy_config="/etc/pppsh/profiles/$1.conf"
+
+    if [ -d "$profile_dir" ]; then
+        [ ! -L "$profile_dir" ] || fail "profile directory must not be a symlink"
+        config="$profile_dir/profile.conf"
+    elif [ -f "$legacy_config" ]; then
+        profile_dir=
+        config=$legacy_config
+    else
+        fail "profile not found: $1"
+    fi
+}
+
+load_profile() {
+    profile_path "$1"
+
+    if [ -n "$profile_dir" ]; then
+        is_root_owned "$profile_dir" || fail "profile directory must be owned by root"
+        is_private_file "$profile_dir" || fail "profile directory permissions must exclude group and others"
+    fi
+
+    [ -f "$config" ] && [ -r "$config" ] && [ ! -L "$config" ] || fail "profile config is missing, unreadable, or a symlink"
+
+    is_root_owned "$config" || fail "profile config must be owned by root"
+    is_private_file "$config" || fail "profile config permissions must exclude group and others"
+
+    ssh_host= ssh_user= identity_file= known_hosts_file= local_ip= peer_ip= mtu=
+    admin_user= source_ip= privilege= seen_keys=' '
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; *=*) key=${line%%=*}; value=${line#*=} ;; *) fail "invalid profile line" ;; esac
+
+        [ -n "$key" ] && [ -n "$value" ] || fail "empty key or value in profile"
+
+        case "$seen_keys" in *" $key "*) fail "duplicate key: $key" ;; esac
+
+        seen_keys="$seen_keys$key "
+
+        case "$key" in
+            host) ssh_host=$value ;; user) ssh_user=$value ;;
+            identity_file) identity_file=$value ;; known_hosts_file) known_hosts_file=$value ;;
+            local_ip) local_ip=$value ;; peer_ip) peer_ip=$value ;; mtu) mtu=$value ;;
+            admin_user) admin_user=$value ;; source_ip) source_ip=$value ;; privilege) privilege=$value ;;
+            *) fail "unknown profile key: $key" ;;
+        esac
+    done < "$config"
+}
+
+validate_profile_values() {
+    [ -n "$ssh_host" ] && [ -n "$ssh_user" ] && [ -n "$identity_file" ] && [ -n "$known_hosts_file" ] && [ -n "$local_ip" ] && [ -n "$peer_ip" ] && [ -n "$mtu" ] || fail "profile is missing a required field"
+
+    case "$ssh_host" in -*|*[!A-Za-z0-9.-]*) fail "host must be an IPv4 address or DNS name" ;; esac
+    case "$ssh_user" in [!A-Za-z_]*|*[!A-Za-z0-9_-]*) fail "invalid SSH username" ;; esac
+
+    is_safe_path "$identity_file" && is_safe_path "$known_hosts_file" || fail "profile paths must be absolute safe paths"
+    is_ipv4 "$local_ip" && is_ipv4 "$peer_ip" || fail "invalid PPP IPv4 address"
+
+    [ "$local_ip" != "$peer_ip" ] || fail "local_ip and peer_ip must differ"
+
+    case "$mtu" in ''|*[!0-9]*) fail "mtu must be an integer" ;; esac
+
+    [ "$mtu" -ge 576 ] && [ "$mtu" -le 1500 ] || fail "mtu must be between 576 and 1500"
+
+    if [ -n "$admin_user" ]; then case "$admin_user" in [!A-Za-z_]*|*[!A-Za-z0-9_-]*) fail "invalid admin_user" ;; esac; fi
+    if [ -n "$source_ip" ]; then is_ipv4 "$source_ip" || fail "invalid source_ip"; fi
+    if [ -n "$privilege" ]; then case "$privilege" in sudo|su) ;; *) fail "invalid privilege method" ;; esac; fi
+}
+
+prompt_value() {
+    prompt_text=$1
+    default_value=$2
+
+    if [ -n "$default_value" ]; then
+        printf '%s [%s]: ' "$prompt_text" "$default_value" >/dev/tty
+    else
+        printf '%s: ' "$prompt_text" >/dev/tty
+    fi
+
+    IFS= read -r answer </dev/tty || fail "cannot read interactive input"
+
+    if [ -z "$answer" ]; then answer=$default_value; fi
+
+    [ -n "$answer" ] || fail "a value is required"
+}
+
+remote_admin() {
+    admin_target="$admin_user@$ssh_host"
+
+    ssh -T -F /dev/null -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+        -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+        "$admin_target" "$@"
+}
+
+remote_admin_tty() {
+    admin_target="$admin_user@$ssh_host"
+
+    ssh -tt -F /dev/null -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+        -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
+        "$admin_target" "$@"
+}
+
+remote_stage_script() {
+    remote_filename=$1
+    command -v scp >/dev/null 2>&1 || fail "scp is not installed"
+
+    printf 'pppsh: command requesting SSH authentication: ssh %s@%s "umask 077; mktemp -d /tmp/pppsh.XXXXXXXX"\n' \
+        "$admin_user" "$ssh_host" >&2
+
+    printf 'pppsh: if prompted now, enter the SSH password for account %s.\n' \
+        "$admin_user" >&2
+
+    remote_stage_dir=$(remote_admin 'umask 077; mktemp -d /tmp/pppsh.XXXXXXXX') || fail "could not create remote staging directory"
+
+    case "$remote_stage_dir" in
+        /tmp/pppsh.*) remote_stage_suffix=${remote_stage_dir#/tmp/pppsh.} ;;
+        *) fail "server returned an invalid staging path" ;;
+    esac
+
+    case "$remote_stage_suffix" in ''|*[!A-Za-z0-9]*) fail "server returned an invalid staging path" ;; esac
+
+    printf 'pppsh: command requesting SCP authentication: scp <temporary installer> %s@%s:%s/\n' \
+        "$admin_user" "$ssh_host" "$remote_stage_dir" >&2
+
+    printf 'pppsh: if prompted, enter the SSH password for account %s.\n' "$admin_user" >&2
+
+    if [ "$#" -ge 2 ]; then
+        scp -F /dev/null -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            "$remote_script" "$2" "$admin_user@$ssh_host:$remote_stage_dir/" || fail "could not copy installer to server"
+    else
+        scp -F /dev/null -o HostKeyAlgorithms=ssh-ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts_file" \
+            "$remote_script" "$admin_user@$ssh_host:$remote_stage_dir/$remote_filename" || fail "could not copy installer to server"
+    fi
+}
+
+remote_stage_cleanup() {
+    [ -n "${remote_stage_dir-}" ] || return 0
+
+    printf 'pppsh: command requesting SSH authentication: ssh %s@%s "rm -rf -- %s"\n' \
+        "$admin_user" "$ssh_host" "$remote_stage_dir" >&2
+
+    printf 'pppsh: if prompted, enter the SSH password for account %s.\n' "$admin_user" >&2
+
+    if remote_admin "rm -rf -- '$remote_stage_dir'"; then
+        remote_stage_dir=
+    else
+        return 1
+    fi
+}
+
+remote_apply() {
+    action=$1
+    remote_script_path="$remote_stage_dir/installer.sh"
+    public_key_file=
+
+    if [ "$action" = install ]; then public_key_file="$remote_stage_dir/id_ed25519.pub"; fi
+
+    remote_command="sudo sh '$remote_script_path' '$action' '$profile' '$local_ip' '$peer_ip' '$mtu' '$source_ip' '$public_key_file'"
+
+    if [ "$privilege" = su ]; then
+        remote_command="su -c \"sh '$remote_script_path' '$action' '$profile' '$local_ip' '$peer_ip' '$mtu' '$source_ip' '$public_key_file'\""
+    fi
+
+    printf 'pppsh: connecting by SSH as %s@%s; if prompted, enter that account password.\n' "$admin_user" "$ssh_host" >&2
+
+    if [ "$privilege" = su ]; then
+        printf 'pppsh: remote privilege command: %s\npppsh: the following su prompt asks for the root password on %s.\n' "$remote_command" "$ssh_host" >&2
+    else
+        printf 'pppsh: remote privilege command: %s\npppsh: the following sudo prompt asks for the password of %s.\n' "$remote_command" "$admin_user" >&2
+    fi
+
+    remote_admin_tty "$remote_command"
+}
+
+create_profile() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root to create profiles"
+    [ "$#" -ge 1 ] || usage
+
+    profile=$1; shift
+
+    valid_name "$profile" || fail "invalid profile name: $profile"
+
+    ssh_host= admin_user= local_ip= peer_ip= mtu= source_ip= privilege=
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --host|--admin-user|--local-ip|--peer-ip|--mtu|--source-ip|--privilege)
+                [ "$#" -ge 2 ] || usage
+                opt=$1; value=$2; shift 2
+                case "$opt" in
+                    --host) ssh_host=$value ;; --admin-user) admin_user=$value ;;
+                    --local-ip) local_ip=$value ;; --peer-ip) peer_ip=$value ;; --mtu) mtu=$value ;;
+                    --source-ip) source_ip=$value ;; --privilege) privilege=$value ;;
+                esac
+                ;;
+            *) usage ;;
+        esac
+    done
+
+    [ -n "$ssh_host" ] || prompt_value 'SSH server host' '' && ssh_host=${ssh_host:-$answer}
+    [ -n "$admin_user" ] || prompt_value 'Administrative SSH user' '' && admin_user=${admin_user:-$answer}
+    [ -n "$local_ip" ] || prompt_value 'Local PPP IPv4' '10.77.0.2' && local_ip=${local_ip:-$answer}
+    [ -n "$peer_ip" ] || prompt_value 'Peer PPP IPv4' '10.77.0.1' && peer_ip=${peer_ip:-$answer}
+    [ -n "$mtu" ] || prompt_value 'PPP MTU' '1400' && mtu=${mtu:-$answer}
+
+    if [ -z "$source_ip" ]; then
+        printf 'Restrict SSH key to a source IPv4 address? Leave blank for no restriction: ' >/dev/tty
+        IFS= read -r source_ip </dev/tty || fail "cannot read interactive input"
+    fi
+
+    [ -n "$privilege" ] || prompt_value 'Privilege method (sudo or su)' 'sudo' && privilege=${privilege:-$answer}
+
+    case "$ssh_host" in -*|*[!A-Za-z0-9.-]*) fail "host must be an IPv4 address or DNS name" ;; esac
+    case "$admin_user" in [!A-Za-z_]*|*[!A-Za-z0-9_-]*) fail "invalid admin user" ;; esac
+    case "$privilege" in sudo|su) ;; *) fail "privilege must be sudo or su" ;; esac
+
+    is_ipv4 "$local_ip" && is_ipv4 "$peer_ip" || fail "invalid PPP IPv4 address"
+
+    [ "$local_ip" != "$peer_ip" ] || fail "local and peer addresses must differ"
+
+    case "$mtu" in ''|*[!0-9]*) fail "MTU must be an integer" ;; esac
+
+    [ "$mtu" -ge 576 ] && [ "$mtu" -le 1500 ] || fail "MTU must be between 576 and 1500"
+
+    if [ -n "$source_ip" ]; then is_ipv4 "$source_ip" || fail "source restriction must be an IPv4 address"; fi
+
+    profile_dir="/etc/pppsh/profiles/$profile"
+
+    [ ! -e "$profile_dir" ] && [ ! -e "/etc/pppsh/profiles/$profile.conf" ] || fail "profile already exists: $profile"
+
+    command -v ssh-keyscan >/dev/null 2>&1 || fail "ssh-keyscan is not installed"
+    command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is not installed"
+    command -v ssh >/dev/null 2>&1 || fail "ssh client is not installed"
+    command -v mktemp >/dev/null 2>&1 || fail "mktemp is not installed"
+
+    umask 077
+
+    create_tmp=$(mktemp -d "${TMPDIR:-/tmp}/pppsh-create.XXXXXX") || fail "cannot create temporary directory"
+    remote_started=no
+
+    cleanup_create() {
+        cleanup_status=$?
+        trap - EXIT HUP INT TERM
+
+        if [ "$remote_started" = yes ]; then
+            printf 'pppsh: attempting to revoke the partial remote profile %s.\n' "$profile" >&2
+            remote_apply remove '' || printf 'pppsh: automatic remote rollback failed; revoke profile %s on %s manually.\n' "$profile" "$ssh_host" >&2
+        fi
+
+        if [ -n "${remote_stage_dir-}" ]; then
+            remote_stage_cleanup || printf 'pppsh: could not remove remote staging directory %s.\n' "$remote_stage_dir" >&2
+        fi
+
+        if [ -n "${stage-}" ] && [ -d "$stage" ]; then rm -rf "$stage"; fi
+
+        rm -rf "$create_tmp"
+
+        exit "$cleanup_status"
+    }
+
+    trap 'cleanup_create' EXIT
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+
+    scan_file="$create_tmp/scan"
+    known_hosts_file="$create_tmp/known_hosts"
+
+    ssh-keyscan -T 8 -t ed25519 "$ssh_host" >"$scan_file" 2>/dev/null || fail "could not obtain an Ed25519 host key from $ssh_host"
+
+    [ -s "$scan_file" ] || fail "server returned no Ed25519 host key"
+
+    fingerprints=$(ssh-keygen -lf "$scan_file" 2>/dev/null | awk 'NF { print $2 }' | sort -u)
+    fingerprint_count=$(printf '%s\n' "$fingerprints" | awk 'NF { count++ } END { print count + 0 }')
+
+    [ "$fingerprint_count" -eq 1 ] || fail "server returned multiple distinct Ed25519 fingerprints; resolve the host identity first"
+
+    fingerprint=$fingerprints
+
+    [ -n "$fingerprint" ] || fail "could not calculate server fingerprint"
+
+    printf 'Server fingerprint for %s: %s\n' "$ssh_host" "$fingerprint" >&2
+    printf 'Do you trust and want to pin this fingerprint? Type yes [no]: ' >/dev/tty
+
+    IFS= read -r trust_fingerprint </dev/tty || fail "cannot read fingerprint confirmation"
+
+    [ "$trust_fingerprint" = yes ] || fail "server fingerprint was not trusted"
+
+    awk 'NF >= 3 && $1 !~ /^#/ { print }' "$scan_file" >"$known_hosts_file"
+    ssh-keygen -q -t ed25519 -N '' -C "pppsh:$profile" -f "$create_tmp/id_ed25519" || fail "could not generate profile key"
+
+    remote_script="$create_tmp/installer.sh"
+
+    cat >"$remote_script" <<'REMOTE_SCRIPT'
+#!/bin/sh
+set -eu
+set -f
+action=$1 name=$2 local_ip=$3 peer_ip=$4 mtu=$5 source_ip=$6 public_key_file=$7
+case "$name" in ''|*[!A-Za-z0-9_-]*) exit 2 ;; esac
+case "$local_ip:$peer_ip:$mtu" in *[!0-9.:]*) exit 2 ;; esac
+case "$source_ip" in '' ) ;; *[!0-9.]*) exit 2 ;; esac
+wrapper="/usr/local/libexec/pppsh/$name"
+auth=/root/.ssh/authorized_keys
+marker="pppsh:$name"
+install_started=no
+install_done=no
+rollback_install() {
+    result=$?
+    trap - 0 HUP INT TERM
+    if [ "$install_started" = yes ] && [ "$install_done" != yes ]; then
+        if [ -n "${tmp-}" ]; then rm -f "$tmp"; fi
+        if [ -f "$auth" ] && [ ! -L "$auth" ]; then
+            cleanup_tmp="$(mktemp /root/.ssh/authorized_keys.XXXXXX)" || exit "$result"
+            awk -v marker="$marker" '$NF != marker { print }' "$auth" >"$cleanup_tmp"
+            chown root:root "$cleanup_tmp"; chmod 600 "$cleanup_tmp"; mv "$cleanup_tmp" "$auth"
+        fi
+        rm -f "$wrapper"
+    fi
+    exit "$result"
+}
+trap 'rollback_install' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+case "$action" in
+  install)
+    mkdir -p /usr/local/libexec/pppsh /root/.ssh
+    [ ! -L /usr/local/libexec/pppsh ] || { echo 'refusing symlinked pppsh libexec directory' >&2; exit 1; }
+    [ ! -L /root/.ssh ] || { echo 'refusing symlinked /root/.ssh' >&2; exit 1; }
+    chmod 700 /root/.ssh
+    [ -x /usr/sbin/pppd ] || { echo 'pppd missing on server' >&2; exit 1; }
+    [ ! -e "$wrapper" ] || { echo 'profile wrapper already exists; refusing to overwrite it' >&2; exit 1; }
+    [ ! -L "$auth" ] || { echo 'refusing symlinked authorized_keys' >&2; exit 1; }
+    [ -r "$public_key_file" ] || { echo 'public key file missing from staging directory' >&2; exit 1; }
+    public_key=$(awk 'NF >= 2 { print $1, $2; exit }' "$public_key_file")
+    case "$public_key" in ssh-ed25519\ *) ;; *) echo 'invalid staged Ed25519 public key' >&2; exit 1 ;; esac
+    touch "$auth"; chmod 600 "$auth"; chown root:root "$auth"
+    [ "$(awk -v marker="$marker" '$NF == marker { n++ } END { print n + 0 }' "$auth")" -eq 0 ] || { echo 'profile authorization already exists' >&2; exit 1; }
+    install_started=yes
+    tmp="$(mktemp "$wrapper.XXXXXX")"
+    printf '#!/bin/sh\nexec /usr/sbin/pppd nodetach noauth notty %s:%s mtu %s mru %s\n' "$peer_ip" "$local_ip" "$mtu" "$mtu" > "$tmp"
+    chown root:root "$tmp"; chmod 700 "$tmp"; mv "$tmp" "$wrapper"
+    tmp="$(mktemp /root/.ssh/authorized_keys.XXXXXX)"
+    cat "$auth" > "$tmp"
+    if [ -s "$auth" ] && [ "$(tail -c 1 "$auth" | wc -l)" -eq 0 ]; then printf '\n' >> "$tmp"; fi
+    if [ -n "$source_ip" ]; then opts="from=\"$source_ip\","; else opts=; fi
+    printf '%srestrict,command="%s" %s %s\n' "$opts" "$wrapper" "$public_key" "$marker" >> "$tmp"
+    chown root:root "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$auth"
+    install_done=yes
+    ;;
+  remove)
+    [ ! -L /usr/local/libexec/pppsh ] || { echo 'refusing symlinked pppsh libexec directory' >&2; exit 1; }
+    [ ! -L /root/.ssh ] || { echo 'refusing symlinked /root/.ssh' >&2; exit 1; }
+    if [ -f "$auth" ]; then
+      [ ! -L "$auth" ] || { echo 'refusing symlinked authorized_keys' >&2; exit 1; }
+      tmp="$(mktemp /root/.ssh/authorized_keys.XXXXXX)"
+      awk -v marker="$marker" '$NF != marker { print }' "$auth" > "$tmp"
+      chown root:root "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$auth"
+    fi
+    rm -f "$wrapper"
+    ;;
+  *) exit 2 ;;
+esac
+REMOTE_SCRIPT
+    chmod 600 "$remote_script"
+
+    known_hosts_file="$create_tmp/known_hosts"
+
+    remote_stage_script installer.sh "$create_tmp/id_ed25519.pub"
+    remote_apply install || fail "remote provisioning failed; installer attempted to roll back its partial changes"
+
+    remote_started=yes
+
+    mkdir -p /etc/pppsh/profiles
+
+    [ ! -L /etc/pppsh/profiles ] || fail "profiles directory must not be a symlink"
+
+    is_root_owned /etc/pppsh/profiles || fail "profiles directory must be owned by root"
+
+    chmod 700 /etc/pppsh/profiles
+
+    stage="/etc/pppsh/profiles/.$profile.tmp.$$"
+
+    (umask 077; mkdir "$stage") || fail "cannot create profile staging directory"
+
+    cp "$create_tmp/id_ed25519" "$stage/id_ed25519"
+    cp "$create_tmp/known_hosts" "$stage/known_hosts"
+    cat >"$stage/profile.conf" <<EOF
+host=$ssh_host
+user=root
+identity_file=/etc/pppsh/profiles/$profile/id_ed25519
+known_hosts_file=/etc/pppsh/profiles/$profile/known_hosts
+local_ip=$local_ip
+peer_ip=$peer_ip
+mtu=$mtu
+admin_user=$admin_user
+privilege=$privilege
+EOF
+    if [ -n "$source_ip" ]; then printf 'source_ip=%s\n' "$source_ip" >>"$stage/profile.conf"; fi
+
+    chmod 600 "$stage/id_ed25519" "$stage/known_hosts" "$stage/profile.conf"
+
+    if ! mv "$stage" "$profile_dir"; then fail "cannot publish local profile; server rollback will be attempted"; fi
+
+    remote_started=no
+    trap - EXIT HUP INT TERM
+    remote_stage_cleanup || printf 'pppsh: could not remove remote staging directory %s.\n' "$remote_stage_dir" >&2
+
+    rm -rf "$create_tmp"
+    printf 'Created profile %s for %s. Run: pppsh connect %s\n' "$profile" "$ssh_host" "$profile"
+}
+
+profile_cli() {
+    [ "$#" -ge 1 ] || usage
+    action=$1; shift
+
+    case "$action" in
+        list)
+            [ "$#" -eq 0 ] || usage
+            [ "$(id -u)" -eq 0 ] || fail "run as root to inspect protected profiles"
+
+            printf '%-24s %s\n' NAME FORMAT
+            set +f
+
+            for entry in /etc/pppsh/profiles/*; do
+                [ -e "$entry" ] || continue
+                [ ! -L "$entry" ] || continue
+
+                case "$entry" in *.conf) name=${entry##*/}; name=${name%.conf} ;; *) name=${entry##*/} ;; esac
+
+                valid_name "$name" || continue
+
+                case "$entry" in *.conf) format=legacy ;; *) format=managed ;; esac
+                printf '%-24s %s\n' "$name" "$format"
+            done
+
+            set -f
+            ;;
+        show|validate)
+            [ "$#" -eq 1 ] || usage
+
+            name=$1; valid_name "$name" || fail "invalid profile name: $name"
+
+            [ "$(id -u)" -eq 0 ] || fail "run as root to inspect protected profiles"
+
+            load_profile "$name"; validate_profile_values
+
+            [ -f "$identity_file" ] && [ -r "$identity_file" ] && [ ! -L "$identity_file" ] || fail "identity file is missing or unsafe"
+            [ -s "$known_hosts_file" ] && [ ! -L "$known_hosts_file" ] || fail "known_hosts file is missing or unsafe"
+
+            is_root_owned "$identity_file" && is_root_owned "$known_hosts_file" || fail "key files must be owned by root"
+            is_private_file "$identity_file" && is_private_file "$known_hosts_file" || fail "key files must exclude group and others"
+
+            if [ "$action" = validate ]; then
+                [ -x /usr/sbin/pppd ] || fail "/usr/sbin/pppd is not executable"
+
+                command -v ssh >/dev/null 2>&1 || fail "ssh client is not installed"
+                command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is not installed"
+
+                ssh-keygen -F "$ssh_host" -f "$known_hosts_file" >/dev/null 2>&1 || fail "known_hosts does not pin this server host"
+                printf 'Profile %s is valid (local checks only).\n' "$name"
+            else
+                printf 'name=%s\nhost=%s\nuser=%s\nlocal_ip=%s\npeer_ip=%s\nmtu=%s\nidentity_file=%s\nknown_hosts_file=%s\n' "$name" "$ssh_host" "$ssh_user" "$local_ip" "$peer_ip" "$mtu" "$identity_file" "$known_hosts_file"
+
+                [ -z "$admin_user" ] || printf 'admin_user=%s\n' "$admin_user"
+                [ -z "$privilege" ] || printf 'privilege=%s\n' "$privilege"
+                [ -z "$source_ip" ] || printf 'source_ip=%s\n' "$source_ip"
+            fi
+            ;;
+        remove)
+            [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
+
+            name=$1; valid_name "$name" || fail "invalid profile name: $name"
+
+            [ "$#" -eq 1 ] || [ "$2" = --local-only ] || usage
+            [ "$(id -u)" -eq 0 ] || fail "run as root to remove profiles"
+
+            profile_path "$name"
+            daemon_pid_matches "$name" && fail "stop the daemon before removing profile $name"
+
+            if [ "$#" -eq 1 ]; then
+                load_profile "$name"
+                validate_profile_values
+
+                [ -n "$admin_user" ] && [ -n "$privilege" ] || fail "this legacy profile has no bootstrap metadata; use --local-only"
+
+                remote_script=$(mktemp "${TMPDIR:-/tmp}/pppsh-remove.XXXXXX") || fail "cannot create temporary remover"
+                trap 'rm -f "$remote_script"; if [ -n "${remote_stage_dir-}" ]; then remote_stage_cleanup || :; fi' EXIT HUP INT TERM
+
+                cat >"$remote_script" <<'REMOTE_REMOVE'
+#!/bin/sh
+set -eu
+name=$1
+case "$name" in ''|*[!A-Za-z0-9_-]*) exit 2 ;; esac
+[ ! -L /root/.ssh ] || { echo 'refusing symlinked /root/.ssh' >&2; exit 1; }
+[ ! -L /usr/local/libexec/pppsh ] || { echo 'refusing symlinked pppsh libexec directory' >&2; exit 1; }
+auth=/root/.ssh/authorized_keys
+wrapper="/usr/local/libexec/pppsh/$name"
+marker="pppsh:$name"
+if [ -f "$auth" ]; then
+    tmp="$(mktemp /root/.ssh/authorized_keys.XXXXXX)"
+    awk -v marker="$marker" '$NF != marker { print }' "$auth" >"$tmp"
+    chown root:root "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$auth"
+fi
+rm -f "$wrapper"
+REMOTE_REMOVE
+                profile=$name
+                remote_stage_script remove.sh
+                remove_script_path="$remote_stage_dir/remove.sh"
+                remote_command="sudo sh '$remove_script_path' '$name'"
+
+                if [ "$privilege" = su ]; then remote_command="su -c \"sh '$remove_script_path' '$name'\""; fi
+
+                printf 'pppsh: connecting by SSH as %s@%s; if prompted, enter that account password.\n' "$admin_user" "$ssh_host" >&2
+                printf 'pppsh: remote privilege command: %s\n' "$remote_command" >&2
+
+                if [ "$privilege" = su ]; then
+                    printf 'pppsh: the su prompt asks for the root password on %s.\n' "$ssh_host" >&2
+                else
+                    printf 'pppsh: the sudo prompt asks for the password of %s.\n' "$admin_user" >&2
+                fi
+
+                remote_admin_tty "$remote_command" || fail "remote revocation failed; local profile was preserved"
+                rm -f "$remote_script"
+                trap - EXIT HUP INT TERM
+                remote_stage_cleanup || printf 'pppsh: could not remove remote staging directory %s.\n' "$remote_stage_dir" >&2
+            else
+                printf 'pppsh: removing only local profile %s; server authorization remains active.\n' "$name" >&2
+            fi
+
+            if [ -n "$profile_dir" ]; then rm -rf -- "$profile_dir"; else rm -f -- "$config"; fi
+            ;;
+        create) create_profile "$@" ;;
+        *) usage ;;
+    esac
+}
+
+daemon_paths() {
+    daemon_state_dir="/run/pppsh/$1"
+    daemon_log_file="/var/log/pppsh/$1.log"
+}
+
+daemon_write_state() {
+    daemon_state_value=$1
+    daemon_tmp="$daemon_state_dir/.state.$$"
+
+    printf '%s\n' "$daemon_state_value" >"$daemon_tmp"
+    chmod 600 "$daemon_tmp"
+    mv -f "$daemon_tmp" "$daemon_state_dir/state"
+}
+
+daemon_pid_matches() {
+    daemon_check_name=$1
+    daemon_paths "$daemon_check_name"
+
+    [ -r "$daemon_state_dir/pid" ] && [ -r "$daemon_state_dir/token" ] || return 1
+
+    daemon_check_pid=$(cat "$daemon_state_dir/pid")
+    daemon_check_token=$(cat "$daemon_state_dir/token")
+
+    case "$daemon_check_pid" in ''|*[!0-9]*) return 1 ;; esac
+
+    [ "$daemon_check_pid" -gt 1 ] 2>/dev/null || return 1
+
+    kill -0 "$daemon_check_pid" 2>/dev/null || return 1
+
+    [ -r "/proc/$daemon_check_pid/cmdline" ] || return 1
+
+    daemon_check_cmd=$(tr '\000' ' ' <"/proc/$daemon_check_pid/cmdline" 2>/dev/null) || return 1
+
+    case "$daemon_check_cmd" in *"__daemon $daemon_check_name $daemon_check_token"*) return 0 ;; esac
+
+    return 1
+}
+
+daemon_prepare_dirs() {
+    mkdir -p /run/pppsh /var/log/pppsh || fail "cannot create daemon directories"
+
+    [ ! -L /run/pppsh ] && [ ! -L /var/log/pppsh ] || fail "daemon directories must not be symlinks"
+
+    is_root_owned /run/pppsh && is_root_owned /var/log/pppsh || fail "daemon directories must be root-owned"
+    chmod 700 /run/pppsh /var/log/pppsh
+}
+
+daemon_start() {
+    [ "$#" -eq 1 ] || usage
+
+    daemon_name=$1
+
+    valid_name "$daemon_name" || fail "invalid profile name: $daemon_name"
+
+    [ "$(id -u)" -eq 0 ] || fail "run as root to start a daemon"
+
+    "$0" profile validate "$daemon_name" >/dev/null || fail "profile validation failed"
+
+    command -v setsid >/dev/null 2>&1 || fail "setsid is required for detached daemon sessions"
+    command -v nohup >/dev/null 2>&1 || fail "nohup is not installed"
+    command -v ip >/dev/null 2>&1 || fail "ip is required to check the PPP address"
+
+    daemon_paths "$daemon_name"
+    load_profile "$daemon_name"
+
+    if ip -o -4 addr show | awk -v wanted="$local_ip" '$3 == "inet" { split($4, a, "/"); if (a[1] == wanted) found=1 } END { exit !found }'; then
+        fail "local PPP address $local_ip is already assigned; another connection may be active"
+    fi
+
+    daemon_prepare_dirs
+
+    if [ -e "$daemon_state_dir" ]; then
+        [ ! -L "$daemon_state_dir" ] || fail "daemon state path must not be a symlink"
+        is_root_owned "$daemon_state_dir" || fail "daemon state must be root-owned"
+        if daemon_pid_matches "$daemon_name"; then fail "daemon is already active for profile $daemon_name"; fi
+        rm -rf "$daemon_state_dir"
+    fi
+
+    mkdir -m 700 "$daemon_state_dir" || fail "could not reserve profile state; another start may be in progress"
+
+    daemon_token="${$}-$(date +%s)"
+
+    printf '%s\n' "$daemon_token" >"$daemon_state_dir/token"
+    chmod 600 "$daemon_state_dir/token"
+
+    daemon_write_state starting
+
+    [ ! -L "$daemon_log_file" ] || fail "daemon log must not be a symlink"
+
+    if [ -e "$daemon_log_file" ]; then
+        [ -f "$daemon_log_file" ] || fail "daemon log path must be a regular file"
+        is_root_owned "$daemon_log_file" || fail "daemon log must be root-owned"
+    else
+        touch "$daemon_log_file"
+    fi
+
+    chmod 600 "$daemon_log_file"
+    nohup setsid "$0" __daemon "$daemon_name" "$daemon_token" >>"$daemon_log_file" 2>&1 </dev/null &
+
+    daemon_launch_pid=$!
+    daemon_wait=0
+
+    while [ "$daemon_wait" -lt 10 ] && [ ! -s "$daemon_state_dir/pid" ]; do
+        sleep 1
+        daemon_wait=$((daemon_wait + 1))
+    done
+
+    if ! daemon_pid_matches "$daemon_name"; then
+        daemon_state_value=$(cat "$daemon_state_dir/state" 2>/dev/null || printf 'failed')
+        fail "daemon did not start (state: $daemon_state_value; log: $daemon_log_file)"
+    fi
+
+    daemon_check_pid=$(cat "$daemon_state_dir/pid")
+    printf 'pppsh: daemon started for %s (supervisor PID %s); PPP negotiation is in progress.\n' "$daemon_name" "$daemon_check_pid"
+}
+
+daemon_main() {
+    [ "$#" -eq 2 ] || exit 2
+
+    daemon_name=$1
+    daemon_token=$2
+
+    valid_name "$daemon_name" || exit 2
+    daemon_paths "$daemon_name"
+
+    [ -d "$daemon_state_dir" ] && [ ! -L "$daemon_state_dir" ] || exit 1
+    [ "$(cat "$daemon_state_dir/token" 2>/dev/null || :)" = "$daemon_token" ] || exit 1
+
+    daemon_self_pid=$$
+
+    printf '%s\n' "$daemon_self_pid" >"$daemon_state_dir/pid"
+    chmod 600 "$daemon_state_dir/pid"
+
+    daemon_write_state active
+
+    daemon_stop_requested=no
+    daemon_child_pid=
+
+    daemon_on_signal() {
+        daemon_stop_requested=yes
+        daemon_write_state stopping
+
+        if [ -n "$daemon_child_pid" ]; then kill -TERM "$daemon_child_pid" 2>/dev/null || :; fi
+    }
+
+    trap 'daemon_on_signal' HUP INT TERM
+    PPPSH_DAEMON_TOKEN=$daemon_token
+    export PPPSH_DAEMON_TOKEN
+
+    "$0" connect "$daemon_name" >>"$daemon_log_file" 2>&1 &
+
+    daemon_child_pid=$!
+
+    if [ "$daemon_stop_requested" = yes ]; then kill -TERM "$daemon_child_pid" 2>/dev/null || :; fi
+
+    printf '%s\n' "$daemon_child_pid" >"$daemon_state_dir/child_pid"
+    chmod 600 "$daemon_state_dir/child_pid"
+
+    while :; do
+        if wait "$daemon_child_pid"; then daemon_child_status=0; else daemon_child_status=$?; fi
+        if ! kill -0 "$daemon_child_pid" 2>/dev/null; then break; fi
+        if [ "$daemon_stop_requested" = yes ]; then kill -TERM "$daemon_child_pid" 2>/dev/null || :; fi
+        sleep 1
+    done
+
+    rm -f "$daemon_state_dir/child_pid"
+
+    if [ "$daemon_stop_requested" = yes ]; then
+        daemon_write_state stopped
+        printf 'pppsh: daemon stopped for profile %s.\n' "$daemon_name"
+        exit 0
+    fi
+
+    printf '%s\n' "$daemon_child_status" >"$daemon_state_dir/exit_code"
+    chmod 600 "$daemon_state_dir/exit_code"
+
+    daemon_write_state failed
+
+    printf 'pppsh: connection process exited with status %s; see %s.\n' "$daemon_child_status" "$daemon_log_file"
+    exit 1
+}
+
+daemon_stop() {
+    [ "$#" -eq 1 ] || usage
+
+    daemon_name=$1
+
+    valid_name "$daemon_name" || fail "invalid profile name: $daemon_name"
+
+    [ "$(id -u)" -eq 0 ] || fail "run as root to stop a daemon"
+
+    daemon_paths "$daemon_name"
+
+    [ -d "$daemon_state_dir" ] || { printf 'pppsh: profile %s is inactive.\n' "$daemon_name"; return 0; }
+
+    daemon_pid_matches "$daemon_name" || { printf 'pppsh: profile %s is inactive (no live supervisor).\n' "$daemon_name"; return 0; }
+
+    daemon_check_pid=$(cat "$daemon_state_dir/pid")
+
+    kill -TERM "$daemon_check_pid" || fail "could not signal daemon PID $daemon_check_pid"
+
+    daemon_wait=0
+
+    while [ "$daemon_wait" -lt 15 ]; do
+        daemon_pid_matches "$daemon_name" || { printf 'pppsh: daemon stopped for profile %s.\n' "$daemon_name"; return 0; }
+        sleep 1
+        daemon_wait=$((daemon_wait + 1))
+    done
+
+    fail "daemon did not stop within 15 seconds; inspect $daemon_log_file"
+}
+
+daemon_status() {
+    [ "$#" -eq 1 ] || usage
+
+    daemon_name=$1
+
+    valid_name "$daemon_name" || fail "invalid profile name: $daemon_name"
+
+    [ "$(id -u)" -eq 0 ] || fail "run as root to inspect daemon status"
+
+    daemon_paths "$daemon_name"
+
+    if daemon_pid_matches "$daemon_name"; then
+        daemon_check_pid=$(cat "$daemon_state_dir/pid")
+        daemon_state_value=$(cat "$daemon_state_dir/state" 2>/dev/null || printf 'starting')
+        printf 'profile=%s\nstatus=%s\nsupervisor_pid=%s\nlog=%s\n' "$daemon_name" "$daemon_state_value" "$daemon_check_pid" "$daemon_log_file"
+        return 0
+    fi
+
+    if [ -d "$daemon_state_dir" ]; then
+        daemon_state_value=$(cat "$daemon_state_dir/state" 2>/dev/null || printf 'stale')
+        case "$daemon_state_value" in
+            failed) printf 'profile=%s\nstatus=failed\nlog=%s\n' "$daemon_name" "$daemon_log_file"; return 1 ;;
+            stopped) printf 'profile=%s\nstatus=stopped\nlog=%s\n' "$daemon_name" "$daemon_log_file" ;;
+            *) printf 'profile=%s\nstatus=inactive\nlast_state=%s\nlog=%s\n' "$daemon_name" "$daemon_state_value" "$daemon_log_file" ;;
+        esac
+    else
+        printf 'profile=%s\nstatus=inactive\n' "$daemon_name"
+    fi
+}
+
+daemon_logs() {
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
+
+    daemon_name=$1
+
+    valid_name "$daemon_name" || fail "invalid profile name: $daemon_name"
+
+    [ "$(id -u)" -eq 0 ] || fail "run as root to read daemon logs"
+
+    daemon_paths "$daemon_name"
+
+    [ -f "$daemon_log_file" ] && [ ! -L "$daemon_log_file" ] || fail "no log exists for profile $daemon_name"
+
+    if [ "$#" -eq 2 ]; then [ "$2" = --follow ] || usage; tail -n 50 -f "$daemon_log_file"; else tail -n 50 "$daemon_log_file"; fi
+}
+
+daemon_cli() {
+    [ "$#" -ge 1 ] || usage
+    daemon_action=$1; shift
+
+    case "$daemon_action" in
+        start) daemon_start "$@" ;;
+        stop) daemon_stop "$@" ;;
+        status) daemon_status "$@" ;;
+        logs) daemon_logs "$@" ;;
+        *) usage ;;
+    esac
+}
+
+if [ "$#" -ge 1 ] && [ "$1" = __daemon ]; then
+    shift
+    daemon_main "$@"
+    exit $?
+fi
+
+if [ "$#" -ge 1 ] && { [ "$1" = start ] || [ "$1" = stop ] || [ "$1" = status ] || [ "$1" = logs ]; }; then
+    daemon_cli "$@"
+    exit $?
+fi
+
+if [ "$#" -ge 1 ] && [ "$1" = profile ]; then
+    shift
+    profile_cli "$@"
+    exit 0
+fi
+
+[ "$#" -eq 2 ] || usage
+[ "$1" = connect ] || usage
+
+profile=$2
+
+case "$profile" in
+    ''|*[!A-Za-z0-9_-]*) fail "invalid profile name: $profile" ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || fail "run as root (for example: sudo pppsh connect $profile)"
+
+if [ -d "/etc/pppsh/profiles/$profile" ]; then
+    [ ! -L "/etc/pppsh/profiles/$profile" ] || fail "profile directory must not be a symbolic link"
+    is_root_owned "/etc/pppsh/profiles/$profile" || fail "profile directory must be owned by root"
+    is_private_file "/etc/pppsh/profiles/$profile" || fail "profile directory permissions must exclude group and others"
+    config="/etc/pppsh/profiles/$profile/profile.conf"
+else
+    config="/etc/pppsh/profiles/$profile.conf"
+fi
+
+[ -f "$config" ] && [ -r "$config" ] || fail "profile not found or unreadable: $config"
+[ ! -L "$config" ] || fail "profile must not be a symbolic link"
+is_root_owned "$config" || fail "profile must be owned by root"
+is_private_file "$config" || fail "profile permissions must exclude group and others"
+
+ssh_host=
+ssh_user=
+identity_file=
+known_hosts_file=
+local_ip=
+peer_ip=
+mtu=
+
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+        ''|'#'*) continue ;;
+        *=*) key=${line%%=*}; value=${line#*=} ;;
+        *) fail "invalid profile line" ;;
+    esac
+
+    [ -n "$key" ] && [ -n "$value" ] || fail "empty key or value in profile"
+
+    case "$key" in
+        host) [ -z "$ssh_host" ] || fail "duplicate key: host"; ssh_host=$value ;;
+        user) [ -z "$ssh_user" ] || fail "duplicate key: user"; ssh_user=$value ;;
+        identity_file) [ -z "$identity_file" ] || fail "duplicate key: identity_file"; identity_file=$value ;;
+        known_hosts_file) [ -z "$known_hosts_file" ] || fail "duplicate key: known_hosts_file"; known_hosts_file=$value ;;
+        local_ip) [ -z "$local_ip" ] || fail "duplicate key: local_ip"; local_ip=$value ;;
+        peer_ip) [ -z "$peer_ip" ] || fail "duplicate key: peer_ip"; peer_ip=$value ;;
+        mtu) [ -z "$mtu" ] || fail "duplicate key: mtu"; mtu=$value ;;
+        admin_user|source_ip|privilege) ;;
+        *) fail "unknown profile key: $key" ;;
+    esac
+done < "$config"
+
+[ -n "$ssh_host" ] || fail "profile is missing host"
+[ -n "$ssh_user" ] || fail "profile is missing user"
+[ -n "$identity_file" ] || fail "profile is missing identity_file"
+[ -n "$known_hosts_file" ] || fail "profile is missing known_hosts_file"
+[ -n "$local_ip" ] || fail "profile is missing local_ip"
+[ -n "$peer_ip" ] || fail "profile is missing peer_ip"
+[ -n "$mtu" ] || fail "profile is missing mtu"
+
+if [ "${PPPSH_DAEMON_TOKEN-}" != "$(cat "/run/pppsh/$profile/token" 2>/dev/null || :)" ] && daemon_pid_matches "$profile"; then
+    fail "profile $profile is already running as a daemon; use pppsh stop $profile first"
+fi
+
+case "$ssh_host" in
+    -*|*[!A-Za-z0-9.-]*) fail "host must be an IPv4 address or DNS name" ;;
+esac
+
+case "$ssh_user" in
+    [!A-Za-z_]*|*[!A-Za-z0-9_-]*) fail "invalid SSH username" ;;
+esac
+
+is_safe_path "$identity_file" || fail "identity_file must be an absolute path using letters, digits, /, ., _, or -"
+is_safe_path "$known_hosts_file" || fail "known_hosts_file must be an absolute path using letters, digits, /, ., _, or -"
+is_ipv4 "$local_ip" || fail "invalid local_ip: $local_ip"
+is_ipv4 "$peer_ip" || fail "invalid peer_ip: $peer_ip"
+
+[ "$local_ip" != "$peer_ip" ] || fail "local_ip and peer_ip must differ"
+
+case "$mtu" in
+    ''|*[!0-9]*) fail "mtu must be an integer" ;;
+esac
+
+[ "$mtu" -ge 576 ] && [ "$mtu" -le 1500 ] || fail "mtu must be between 576 and 1500"
+
+[ -r "$identity_file" ] && [ -f "$identity_file" ] || fail "identity file not found or unreadable"
+[ -s "$known_hosts_file" ] || fail "known_hosts file is missing or empty"
+[ ! -L "$identity_file" ] || fail "identity file must not be a symbolic link"
+[ ! -L "$known_hosts_file" ] || fail "known_hosts file must not be a symbolic link"
+
+is_root_owned "$identity_file" || fail "identity file must be owned by root"
+is_root_owned "$known_hosts_file" || fail "known_hosts file must be owned by root"
+is_private_file "$identity_file" || fail "identity file permissions must exclude group and others"
+is_private_file "$known_hosts_file" || fail "known_hosts permissions must exclude group and others"
+
+[ -x /usr/sbin/pppd ] || fail "/usr/sbin/pppd is not executable"
+
+command -v ssh >/dev/null 2>&1 || fail "ssh client is not installed"
+
+ssh_bin=$(command -v ssh)
+is_safe_path "$ssh_bin" || fail "ssh executable path contains unsupported characters"
+ssh_command="$ssh_bin -T -e none -F /dev/null -i $identity_file -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts_file -o ClearAllForwardings=yes -o ForwardAgent=no -o RequestTTY=no -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 $ssh_user@$ssh_host"
+
+printf 'pppsh: connecting %s to %s@%s (%s <-> %s, MTU %s)\n' \
+    "$profile" "$ssh_user" "$ssh_host" "$local_ip" "$peer_ip" "$mtu" >&2
+
+exec /usr/sbin/pppd nodetach noauth \
+    "$local_ip:$peer_ip" mtu "$mtu" mru "$mtu" \
+    pty "$ssh_command"
